@@ -1,73 +1,67 @@
-import { prisma } from "../lib/prisma";
-import { secApiSearch, fetchHtml } from "../lib/sec";
-import { parseFilingHtml } from "../lib/parse";
-import { normalizeBankName } from "../lib/normalize";
+import { prisma } from "./prisma";
+import { secApiSearch, fetchHtml } from "./sec";
+import { parseFilingHtml } from "./parse";
+import { normalizeBankName } from "./normalize";
 
 export default async function discoverAndIngest() {
-  const to = new Date();
-  const from = new Date(Date.now()-1000*60*60*24*60); // last 60 days
-  const fmt = (d:Date)=>d.toISOString().slice(0,19)+"Z";
+  console.log("🔍 Discovering new filings from SEC...");
+  const filings = await secApiSearch();
 
-  const result = await secApiSearch(
-    `("acted as" OR "placement agent" OR "registered direct" OR "underwritten" OR "Sales Agreement")`,
-    fmt(from), fmt(to)
-  );
-
-  const hits = (result as any)?.hits?.hits || [];
-  for (const h of hits) {
-    const src = h._source;
-    const cik = (src.cik || "").toString().replace(/^0+/,"");
-    const accession = src.accessionNo;
-    const primaryUrl = src.linkToHtml;
-    if (!cik || !accession || !primaryUrl) continue;
-
-    const company = await prisma.company.upsert({
-      where: { cik },
-      update: { name: src.companyName || cik, ticker: src.ticker || null },
-      create: { cik, name: src.companyName || cik, ticker: src.ticker || null }
-    });
-
-    const filing = await prisma.filing.upsert({
-      where: { accession },
-      update: {},
-      create: {
-        companyId: company.id,
-        accession,
-        form: src.formType,
-        filedAt: new Date(src.filedAt),
-        primaryUrl,
-        edgarBaseUrl: src.linkToFilingDetails
-      }
-    });
-
-    const html = await fetchHtml(primaryUrl);
-    const parsed = parseFilingHtml(html);
-
-    const deal = await prisma.deal.create({
-      data: {
-        companyId: company.id,
-        filingId: filing.id,
-        dealType: (parsed.dealType as any) ?? "Other",
-        status: (parsed.status as any) ?? "Active",
-        sourceSnippet: parsed.sourceSnippet?.slice(0,1000) || null,
-        sourceUrl: primaryUrl,
-        grossProceeds: parsed.terms.grossProceeds || undefined,
-        pricePerUnit: parsed.terms.pricePerUnit || undefined,
-        discountPct: parsed.terms.discountPct || undefined,
-        warrantTerms: parsed.terms.warrantTerms || undefined
-      }
-    });
-
-    for (const b of parsed.banks) {
-      const name = await normalizeBankName(b.name);
-      const bank = await prisma.bank.upsert({
-        where: { name },
-        update: {},
-        create: { name, nameNormalized: name.toLowerCase() }
+  for (const filing of filings) {
+    try {
+      const existing = await prisma.filing.findUnique({
+        where: { accession: filing.accession },
       });
-      await prisma.dealBank.create({
-        data: { dealId: deal.id, bankId: bank.id, role: (b.role as any) ?? "Agent" }
+      if (existing) continue;
+
+      const html = await fetchHtml(filing.url);
+      const parsed = parseFilingHtml(html);
+
+      await prisma.filing.create({
+        data: {
+          accession: filing.accession,
+          form: filing.form,
+          filedAt: new Date(filing.filedAt),
+          primaryUrl: filing.url,
+          edgarBaseUrl: filing.baseUrl,
+          company: {
+            connectOrCreate: {
+              where: { cik: filing.cik },
+              create: {
+                cik: filing.cik,
+                name: filing.companyName,
+                ticker: filing.ticker,
+              },
+            },
+          },
+        },
       });
+
+      for (const deal of parsed.deals) {
+        const normBank = normalizeBankName(deal.bank);
+        const bank = await prisma.bank.upsert({
+          where: { nameNormalized: normBank },
+          update: {},
+          create: { name: deal.bank, nameNormalized: normBank },
+        });
+
+        await prisma.deal.create({
+          data: {
+            dealType: deal.type,
+            pricePerUnit: deal.price,
+            discountPct: deal.discount,
+            grossProceeds: deal.amount,
+            company: { connect: { cik: filing.cik } },
+            filing: { connect: { accession: filing.accession } },
+            participants: {
+              create: { bankId: bank.id, role: deal.role },
+            },
+          },
+        });
+      }
+    } catch (err) {
+      console.error("❌ Error processing filing", filing.accession, err);
     }
   }
-}
+  console.log("✅ Discovery complete.");
+
