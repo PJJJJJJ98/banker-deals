@@ -1,0 +1,90 @@
+import { prisma } from "./prisma";
+import { secApiSearch, fetchHtml } from "./sec";
+import { parseFilingHtml } from "./parse";
+import { normalizeBankName } from "./normalize";
+
+export default async function discoverAndIngest(): Promise<void> {
+  const result: any = await secApiSearch();
+  const filings: any[] = Array.isArray(result) ? result : [];
+
+  if (filings.length === 0) {
+    return;
+  }
+
+  for (const f of filings) {
+    try {
+      const accession = String(f.accession  f.accessionNo  f.accession_number || "");
+      const url = String(f.url  f.linkToHtml  "");
+      const cik = String(f.cik  f.cikNumber  "");
+      const companyName = String(f.companyName  f.company  "");
+      const ticker = f.ticker ? String(f.ticker) : null;
+      const form = String(f.form  f.formType  "UNKNOWN");
+      const filedAtISO = String(f.filedAt  f.filingDate  new Date().toISOString());
+      const baseUrl = String(f.baseUrl  f.linkToFilingDetails  "");
+
+      if (!accession  !url  !cik) {
+        continue;
+      }
+
+      const exists = await prisma.filing.findUnique({ where: { accession } });
+      if (exists) {
+        continue;
+      }
+
+      const company = await prisma.company.upsert({
+        where: { cik },
+        update: { name: companyName || cik, ticker },
+        create: { cik, name: companyName || cik, ticker }
+      });
+
+      const filing = await prisma.filing.create({
+        data: {
+          companyId: company.id,
+          accession,
+          form,
+          filedAt: new Date(filedAtISO),
+          primaryUrl: url,
+          edgarBaseUrl: baseUrl,
+          status: "fetched"
+        }
+      });
+
+      const html = await fetchHtml(url);
+      const parsed: any = parseFilingHtml(html);
+
+      const deal = await prisma.deal.create({
+        data: {
+          companyId: company.id,
+          filingId: filing.id,
+          dealType: parsed && parsed.dealType ? parsed.dealType : "Other",
+          status: parsed && parsed.status ? parsed.status : "Active",
+          sourceSnippet: parsed && parsed.sourceSnippet ? String(parsed.sourceSnippet).slice(0, 1000) : null,
+          sourceUrl: url,
+          pricePerUnit: parsed && parsed.terms && parsed.terms.pricePerUnit != null ? parsed.terms.pricePerUnit : null,
+          grossProceeds: parsed && parsed.terms && parsed.terms.grossProceeds != null ? parsed.terms.grossProceeds : null,
+          discountPct: parsed && parsed.terms && parsed.terms.discountPct != null ? parsed.terms.discountPct : null,
+          warrantTerms: parsed && parsed.terms && parsed.terms.warrantTerms != null ? parsed.terms.warrantTerms : undefined
+        }
+      });
+
+      if (parsed && Array.isArray(parsed.banks)) {
+        for (const b of parsed.banks) {
+          const rawName = b && b.name ? String(b.name) : "Unknown";
+          const cleaned = await normalizeBankName(rawName);
+          const norm = cleaned.toLowerCase();
+          const bank = await prisma.bank.upsert({
+            where: { nameNormalized: norm },
+            update: {},
+            create: { name: cleaned, nameNormalized: norm }
+          });
+          const role = b && b.role ? String(b.role) : "Agent";
+          await prisma.dealBank.create({
+            data: { dealId: deal.id, bankId: bank.id, role: role as any }
+          });
+        }
+      }
+    } catch (err) {
+      console.error("discover error", err);
+    }
+  }
+}
