@@ -1,31 +1,41 @@
-import fetch from "node-fetch";
-import { ENV } from "../env";
+import express from "express";
+import cors from "cors";
 
-export async function fetchSubmissions(cik: string) {
-  const padded = cik.padStart(10,"0");
-  const res = await fetch(`https://data.sec.gov/submissions/CIK${padded}.json`, {
-    headers: { "User-Agent": ENV.SEC_USER_AGENT }
-  });
-  if (!res.ok) throw new Error(`submissions ${res.status}`);
-  return res.json();
-}
+// Routes (flat files)
+import health from "./health";
+import deals from "./deals";
+import banks from "./banks";
+import companies from "./companies";
 
-export async function fetchHtml(url: string) {
-  const res = await fetch(url, { headers: { "User-Agent": ENV.SEC_USER_AGENT }});
-  if (!res.ok) throw new Error(`fetch ${res.status}`);
-  return res.text();
-}
+// Jobs + env
+import discoverAndIngest from "./discover";
+import { ENV } from "./env";
 
-export async function secApiSearch(query: string, fromISO: string, toISO: string) {
-  if (!ENV.SEC_API_KEY) return { hits: { hits: [] } };
-  const res = await fetch("https://api.sec-api.io/search", {
-    method: "POST",
-    headers: { "x-api-key": ENV.SEC_API_KEY, "content-type":"application/json" },
-    body: JSON.stringify({
-      query: { query_string: { query: `${query} AND filedAt:[${fromISO} TO ${toISO}] AND formType:(8-K OR 424B5 OR 424B2 OR 424B3 OR FWP OR S-1 OR S-3 OR 6-K)` } },
-      from: 0, size: 100, sort: [{ filedAt: { order: "desc" }}]
-    })
-  });
-  if (!res.ok) throw new Error(`sec-api ${res.status}`);
-  return res.json();
-}
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Route registration
+app.use("/api/health", health);
+app.use("/api/deals", deals);
+app.use("/api/banks", banks);
+app.use("/api/companies", companies);
+
+// Trigger data ingestion manually
+app.post("/internal/ingest", async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth || auth !== `Bearer ${ENV.API_TOKEN}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
+    await discoverAndIngest();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Ingest error", err);
+    res.status(500).json({ error: "Failed to ingest" });
+  }
+});
+
+const port = ENV.PORT || 8080;
+app.listen(port, () => console.log(`✅ API running on port ${port}`));
