@@ -3,23 +3,11 @@ import { secApiSearch, fetchHtml } from "./sec";
 import { parseFilingHtml } from "./parse";
 import { normalizeBankName } from "./normalize";
 
-/** Minimal shape we expect back from secApiSearch() */
-type FilingHit = {
-  accession?: string;
-  form?: string;
-  filedAt?: string;
-  url?: string;
-  baseUrl?: string;
-  cik?: string;
-  companyName?: string;
-  ticker?: string | null;
-};
-
 export default async function discoverAndIngest() {
   console.log("🔍 Discovering new filings from SEC…");
 
-  // Get an array of filings (your sec.ts returns data.filings || [])
-  const filings: FilingHit[] = await secApiSearch();
+  // Be lenient: allow any shape; sec.ts should return an array.
+  const filings: any[] = await secApiSearch();
 
   if (!Array.isArray(filings) || filings.length === 0) {
     console.log("ℹ️ No new filings returned.");
@@ -28,100 +16,102 @@ export default async function discoverAndIngest() {
 
   for (const f of filings) {
     try {
-      // Basic guards
-      if (!f.accession  !f.url  !f.cik) {
-        console.log("↷ Skipping filing with missing keys", {
-          accession: f.accession,
-          url: f.url,
-          cik: f.cik,
-        });
+      // Normalize common field names across different sources
+      const accession =
+        f.accession ||
+        f.accessionNo ||
+        f.accession_number ||
+        "";
+      const url =
+        f.url ||
+        f.linkToHtml ||
+        "";
+      const cik = ((f.cik  f.cikNumber  "") as string).toString();
+      const companyName = f.companyName  f.company  "";
+      const ticker = f.ticker || null;
+      const form = f.form  f.formType  "UNKNOWN";
+      const filedAt = f.filedAt  f.filingDate  new Date().toISOString();
+      const baseUrl = f.baseUrl  f.linkToFilingDetails  "";
+
+      if (!accession  !url  !cik) {
+        console.log("↷ Skipping (missing keys)", { accession, url, cik });
         continue;
       }
 
-      // Skip if we already saved this accession
-      const already = await prisma.filing.findUnique({
-        where: { accession: f.accession },
-        select: { id: true },
-      });
-      if (already) {
-        // console.log("✅ Already ingested", f.accession);
+      // Skip duplicates
+      const exists = await prisma.filing.findUnique({ where: { accession } });
+      if (exists) {
+        // console.log("Already ingested", accession);
         continue;
       }
 
       // Upsert company
       const company = await prisma.company.upsert({
-        where: { cik: f.cik },
-        update: {
-          name: f.companyName ?? f.cik,
-          ticker: f.ticker ?? null,
-        },
-        create: {
-          cik: f.cik,
-          name: f.companyName ?? f.cik,
-          ticker: f.ticker ?? null,
-        },
+        where: { cik },
+        update: { name: companyName  cik, ticker: ticker  null },
+        create: { cik, name: companyName  cik, ticker: ticker  null }
       });
 
-      // Create filing shell
+      // Create filing record
       const filing = await prisma.filing.create({
         data: {
           companyId: company.id,
-          accession: f.accession,
-          form: f.form ?? "UNKNOWN",
-          filedAt: f.filedAt ? new Date(f.filedAt) : new Date(),
-          primaryUrl: f.url,
-          edgarBaseUrl: f.baseUrl ?? "",
-          status: "fetched",
-        },
+          accession,
+          form,
+          filedAt: new Date(filedAt),
+          primaryUrl: url,
+          edgarBaseUrl: baseUrl,
+          status: "fetched"
+        }
       });
 
-      // Fetch + parse HTML to extract deal info
-      const html = await fetchHtml(f.url);
-      const parsed = parseFilingHtml(html);
-      // parsed: { banks[], dealType, terms{pricePerUnit,grossProceeds,discountPct,warrantTerms}, status, sourceSnippet }
+      // Fetch + parse the HTML
+      const html = await fetchHtml(url);
+      const parsed: any = parseFilingHtml(html);
+      // parsed.dealType, parsed.status, parsed.terms{pricePerUnit,grossProceeds,discountPct,warrantTerms}, parsed.banks[], parsed.sourceSnippet
 
-      // Create the deal row (one per filing; good enough for MVP)
+      // Create a deal entry
       const deal = await prisma.deal.create({
         data: {
           companyId: company.id,
           filingId: filing.id,
-          dealType: (parsed.dealType as any) ?? "Other",
-          status: (parsed.status as any) ?? "Active",
-          sourceSnippet: parsed.sourceSnippet?.slice(0, 1000) ?? null,
-          sourceUrl: f.url,
-          pricePerUnit: parsed.terms?.pricePerUnit ?? null,
-          grossProceeds: parsed.terms?.grossProceeds ?? null,
-          discountPct: parsed.terms?.discountPct ?? null,
-          warrantTerms: parsed.terms?.warrantTerms ?? undefined,
-        },
+          dealType: parsed?.dealType || "Other",
+          status: parsed?.status || "Active",
+          sourceSnippet: parsed?.sourceSnippet ? String(parsed.sourceSnippet).slice(0, 1000) : null,
+          sourceUrl: url,
+          pricePerUnit: parsed?.terms?.pricePerUnit ?? null,
+          grossProceeds: parsed?.terms?.grossProceeds ?? null,
+          discountPct: parsed?.terms?.discountPct ?? null,
+          warrantTerms: parsed?.terms?.warrantTerms ?? undefined
+        }
       });
 
-      // Link banks/roles to the deal
-      if (Array.isArray(parsed.banks)) {
+      // Link banks/roles
+      if (Array.isArray(parsed?.banks)) {
         for (const b of parsed.banks) {
-          const clean = await normalizeBankName(b.name || "Unknown");
+          const rawName = b?.name ? String(b.name) : "Unknown";
+          const clean = await normalizeBankName(rawName);
           const bank = await prisma.bank.upsert({
             where: { nameNormalized: clean.toLowerCase() },
             update: {},
-            create: { name: clean, nameNormalized: clean.toLowerCase() },
+            create: { name: clean, nameNormalized: clean.toLowerCase() }
           });
-
           await prisma.dealBank.create({
             data: {
               dealId: deal.id,
               bankId: bank.id,
-              role: (b.role as any) ?? "Agent",
-            },
+              role: (b?.role as any) || "Agent"
+            }
           });
         }
       }
 
-      console.log("✅ Ingested", f.accession, f.companyName ?? f.cik);
+      console.log("✅ Ingested", accession, companyName || cik);
     } catch (err) {
-      console.error("❌ Error on filing", f?.accession, err);
+      console.error("❌ Error processing filing", f?.accession || f?.accessionNo, err);
     }
   }
 
   console.log("✅ Discovery run complete.");
-
+}
 
