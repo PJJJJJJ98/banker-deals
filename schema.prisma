@@ -1,0 +1,115 @@
+datasource db { provider = "postgresql"; url = env("DATABASE_URL") }
+generator client { provider = "prisma-client-js" }
+
+model Company {
+  id         BigInt   @id @default(autoincrement())
+  cik        String   @unique
+  ticker     String?  @db.VarChar(12)
+  name       String
+  exchange   String?
+  sector     String?
+  filings    Filing[]
+  deals      Deal[]
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Bank {
+  id             BigInt       @id @default(autoincrement())
+  name           String       @unique
+  nameNormalized String       @unique
+  aliases        BankAlias[]
+  participants   DealBank[]
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+}
+
+model BankAlias {
+  id      BigInt @id @default(autoincrement())
+  alias   String @unique
+  bank    Bank   @relation(fields: [bankId], references: [id])
+  bankId  BigInt
+}
+
+model Filing {
+  id            BigInt   @id @default(autoincrement())
+  company       Company  @relation(fields: [companyId], references: [id])
+  companyId     BigInt
+  accession     String   @unique
+  form          String
+  filedAt       DateTime
+  primaryUrl    String
+  edgarBaseUrl  String
+  rawHtml       String?
+  status        String   @default("fetched")
+  deals         Deal[]
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model Deal {
+  id            BigInt    @id @default(autoincrement())
+  company       Company   @relation(fields: [companyId], references: [id])
+  companyId     BigInt
+  filing        Filing?   @relation(fields: [filingId], references: [id])
+  filingId      BigInt?
+  dealType      DealType
+  grossProceeds Decimal?
+  pricePerUnit  Decimal?
+  discountPct   Decimal?
+  warrantTerms  Json?
+  notes         String?
+  status        DealStatus @default(Active)
+  effectiveDate DateTime?
+  closedDate    DateTime?
+  sourceSnippet String?
+  sourceUrl     String?
+  participants  DealBank[]
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model DealBank {
+  id      BigInt @id @default(autoincrement())
+  deal    Deal   @relation(fields: [dealId], references: [id])
+  dealId  BigInt
+  bank    Bank   @relation(fields: [bankId], references: [id])
+  bankId  BigInt
+  role    BankRole
+}
+
+enum DealType {
+  ATM
+  Registered_Direct
+  Underwritten
+  PIPE
+  ELOC_SEPA
+  Warrant_Inducement
+  Convertible_Notes
+  Senior_Notes
+  Other
+}
+
+enum DealStatus {
+  Active
+  Finished
+  Pending
+}
+
+enum BankRole {
+  Placement_Agent
+  Sales_Agent
+  Underwriter
+  Bookrunner
+  Co_Manager
+  Financial_Advisor
+  Agent
+  Other
+}
+
+model Watchlist {
+  id        BigInt   @id @default(autoincrement())
+  name      String
+  query     Json
+  createdAt DateTime @default(now())
+}
