@@ -8,7 +8,6 @@ import banks from "./banks";
 import companies from "./companies";
 
 // Jobs + env
-import discoverAndIngest from "./discover";
 import { ENV } from "./env";
 
 const app = express();
@@ -27,14 +26,7 @@ app.post("/internal/ingest", async (req, res) => {
   if (!auth || auth !== `Bearer ${ENV.API_TOKEN}`) {
     return res.status(401).json({ error: "Unauthorized" });
   }
-
-  try {
-    await discoverAndIngest();
     res.json({ ok: true });
-  } catch (err) {
-    console.error("Ingest error", err);
-    res.status(500).json({ error: "Failed to ingest" });
-  }
 });
 
 const port = ENV.PORT || 8080;
